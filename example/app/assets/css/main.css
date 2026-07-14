@@ -1,0 +1,12 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+:root {
+  --ui-radius: 0.6rem;
+  --ui-container: 90rem;
+}
+
+body {
+  min-height: 100dvh;
+  background: var(--ui-bg);
+}

@@ -5,4 +5,4 @@ export default withNuxt({
     '@typescript-eslint/no-explicit-any': 'off',
     '@typescript-eslint/no-dynamic-delete': 'off'
   }
-})
+}).append({ ignores: ['example/**'] })
