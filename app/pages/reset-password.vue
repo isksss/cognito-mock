@@ -1,0 +1,7 @@
+<script setup lang="ts">
+import * as z from 'zod'; import type { FormSubmitEvent } from '@nuxt/ui'
+const route = useRoute(); const schema = z.object({ code: z.string().length(6), password: z.string().min(8) }); type Schema = z.output<typeof schema>; const state = reactive<Partial<Schema>>({ code: '', password: '' }); const error = ref('')
+const cleanQuery = computed(() => new URLSearchParams(Object.entries(route.query).filter(([key]) => key !== 'username').map(([key, value]) => [key, String(value)])).toString())
+async function submit(event: FormSubmitEvent<Schema>) { try { await $fetch('/api/auth/reset', { method: 'POST', body: { ...event.data, username: String(route.query.username), clientId: String(route.query.client_id || 'default-client') } }); await navigateTo(`/login?${cleanQuery.value}`) } catch (cause: any) { error.value = cause?.data?.message || cause?.message } }
+</script>
+<template><AuthShell title="新しいパスワード" description="確認コードと新しいパスワードを入力してください"><UAlert v-if="error" color="error" variant="soft" :description="error" class="mb-5" /><UForm :schema="schema" :state="state" class="space-y-5" @submit="submit"><UFormField name="code" label="確認コード" required><UInput v-model="state.code" class="w-full" /></UFormField><UFormField name="password" label="新しいパスワード" required><UInput v-model="state.password" type="password" class="w-full" /></UFormField><UButton type="submit" label="更新" block size="lg" /></UForm></AuthShell></template>

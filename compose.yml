@@ -1,0 +1,17 @@
+services:
+  cognito-mock:
+    build: .
+    image: ghcr.io/isksss/cognito-mock:latest
+    ports:
+      - "3000:3000"
+    environment:
+      PUBLIC_URL: http://localhost:3000
+      COGNITO_MOCK_MODE: permissive
+      ALLOWED_ORIGINS: http://localhost:3001
+      CONFIG_PATH: /config/cognito-mock.yml
+    volumes:
+      - cognito-data:/data
+      - ./examples/cognito-mock.yml:/config/cognito-mock.yml:ro
+
+volumes:
+  cognito-data:

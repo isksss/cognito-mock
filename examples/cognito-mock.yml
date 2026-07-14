@@ -1,0 +1,26 @@
+pools:
+  - id: ap-northeast-1_example
+    name: Local development
+    groups:
+      - name: developers
+        description: Local developers
+    clients:
+      - id: exampleclientid
+        name: Example web app
+        callbacks:
+          - http://localhost:3001/callback
+        logouts:
+          - http://localhost:3001
+        scopes: [openid, email, profile]
+        theme:
+          primaryColor: "#4f46e5"
+          backgroundColor: "#f8fafc"
+    users:
+      - username: developer@example.com
+        password: Password123!
+        confirmed: true
+        attributes:
+          email: developer@example.com
+          email_verified: "true"
+          name: Local Developer
+        groups: [developers]

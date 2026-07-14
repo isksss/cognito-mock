@@ -1,0 +1,9 @@
+node_modules
+.nuxt
+.output
+.data
+data/*.sqlite*
+coverage
+.env
+playwright-report
+test-results
