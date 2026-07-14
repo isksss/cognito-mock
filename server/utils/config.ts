@@ -7,7 +7,7 @@ export const shouldLogCodes = () => process.env.LOG_CODES !== 'false'
 
 export function publicUrl(event?: H3Event) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '')
-  return event ? getRequestURL(event).origin : 'http://localhost:3000'
+  return event ? getRequestURL(event).origin : 'http://localhost:9999'
 }
 
 export function splitList(value: string | undefined) {
