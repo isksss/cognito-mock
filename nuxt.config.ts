@@ -3,6 +3,7 @@ export default defineNuxtConfig({
   modules: ['@nuxt/ui', '@nuxt/eslint'],
   css: ['~/assets/css/main.css'],
   devtools: { enabled: false },
+  devServer: { port: 9999 },
   nitro: {
     preset: 'node-server',
     experimental: { database: false }

@@ -5,24 +5,24 @@
 ## 起動
 
 ```bash
-docker run --rm -p 3000:3000 -v cognito-data:/data ghcr.io/isksss/cognito-mock:latest
+docker run --rm -p 9999:9999 -v cognito-data:/data ghcr.io/isksss/cognito-mock:latest
 ```
 
-- Managed Login: `http://localhost:3000/oauth2/authorize`
-- AWS SDK endpoint: `http://localhost:3000`
-- OIDC issuer: `http://localhost:3000/{userPoolId}`
-- 管理画面: `http://localhost:3000/__cognito_mock`
-- Health check: `http://localhost:3000/health`
+- Managed Login: `http://localhost:9999/oauth2/authorize`
+- AWS SDK endpoint: `http://localhost:9999`
+- OIDC issuer: `http://localhost:9999/{userPoolId}`
+- 管理画面: `http://localhost:9999/__cognito_mock`
+- Health check: `http://localhost:9999/health`
 
 既定の`permissive`モードでは、未知のPool IDとClient IDを自動作成します。loopbackのCallback URLとoriginも自動登録されます。
 
 ## OAuth / Managed Login
 
 ```text
-http://localhost:3000/oauth2/authorize?response_type=code&client_id=my-client&redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback&scope=openid%20email%20profile&code_challenge=...&code_challenge_method=S256
+http://localhost:9999/oauth2/authorize?response_type=code&client_id=my-client&redirect_uri=http%3A%2F%2Flocalhost%3A3001%2Fcallback&scope=openid%20email%20profile&code_challenge=...&code_challenge_method=S256
 ```
 
-Token交換先は`http://localhost:3000/oauth2/token`です。Code + PKCE、Refresh、Revoke、UserInfo、Logoutに対応しています。
+Token交換先は`http://localhost:9999/oauth2/token`です。Code + PKCE、Refresh、Revoke、UserInfo、Logoutに対応しています。
 
 ## AWS SDK v3
 
@@ -31,7 +31,7 @@ import { CognitoIdentityProviderClient, InitiateAuthCommand } from '@aws-sdk/cli
 
 const cognito = new CognitoIdentityProviderClient({
   region: 'ap-northeast-1',
-  endpoint: 'http://localhost:3000',
+  endpoint: 'http://localhost:9999',
   credentials: { accessKeyId: 'local', secretAccessKey: 'local' }
 })
 
@@ -42,7 +42,7 @@ await cognito.send(new InitiateAuthCommand({
 }))
 ```
 
-AWS CLIでは各コマンドへ`--endpoint-url http://localhost:3000`を追加します。
+AWS CLIでは各コマンドへ`--endpoint-url http://localhost:9999`を追加します。
 
 ## Amplify
 
@@ -54,10 +54,10 @@ Amplify.configure({
     Cognito: {
       userPoolId: 'ap-northeast-1_example',
       userPoolClientId: 'my-client',
-      userPoolEndpoint: 'http://localhost:3000',
+      userPoolEndpoint: 'http://localhost:9999',
       loginWith: {
         oauth: {
-          domain: 'localhost:3000',
+          domain: 'localhost:9999',
           scopes: ['openid', 'email', 'profile'],
           redirectSignIn: ['http://localhost:3001/callback'],
           redirectSignOut: ['http://localhost:3001'],
@@ -74,7 +74,7 @@ Amplify.configure({
 `localhost`、`127.0.0.1`、`[::1]`はポートを問わず既定で許可されます。追加originはカンマ区切りで指定します。
 
 ```bash
-docker run --rm -p 3000:3000 \
+docker run --rm -p 9999:9999 \
   -e ALLOWED_ORIGINS=https://app.example.test \
   -e ALLOWED_CALLBACK_HOSTS=app.example.test \
   ghcr.io/isksss/cognito-mock:latest
@@ -83,6 +83,21 @@ docker run --rm -p 3000:3000 \
 プリフライトと`Authorization`、`X-Amz-Target`、`X-Amz-Date`、`X-Amz-Security-Token`に対応しています。拒否されたoriginは管理画面のCORSタブで確認できます。
 
 ## YAML初期データ
+
+設定ファイルをマウントするDocker Compose例です。
+
+```yaml
+services:
+  cognito-mock:
+    image: ghcr.io/isksss/cognito-mock:latest
+    ports:
+      - "9999:9999"
+    environment:
+      PUBLIC_URL: http://localhost:9999
+      CONFIG_PATH: /config/cognito-mock.yml
+    volumes:
+      - ./examples/cognito-mock.yml:/config/cognito-mock.yml:ro
+```
 
 ```bash
 docker compose up --build
@@ -102,7 +117,7 @@ docker compose up --build
 | `ALLOWED_ORIGINS` | loopback | 追加CORS origin |
 | `ALLOWED_CALLBACK_HOSTS` | loopback | Callback自動学習対象 |
 | `LOG_CODES` | `true` | 確認コードの標準出力 |
-| `PORT` | `3000` | 待受ポート |
+| `PORT` | `9999` | 待受ポート |
 
 ## 対応範囲
 
