@@ -20,7 +20,8 @@ async function poolKeys(poolId: string) {
     privateJwk.kid = publicJwk.kid = kid
     privateJwk.alg = publicJwk.alg = 'RS256'
     privateJwk.use = publicJwk.use = 'sig'
-    db().prepare('UPDATE pools SET private_jwk=?, public_jwk=?, updated_at=? WHERE id=?').run(JSON.stringify(privateJwk), JSON.stringify(publicJwk), epochMs(), poolId)
+    db().prepare('UPDATE pools SET private_jwk=?, public_jwk=?, updated_at=? WHERE id=? AND (private_jwk IS NULL OR public_jwk IS NULL)')
+      .run(JSON.stringify(privateJwk), JSON.stringify(publicJwk), epochMs(), poolId)
     pool = getPool(poolId)!
   }
   return { privateJwk: json<JWK>(pool.private_jwk, {}), publicJwk: json<JWK>(pool.public_jwk, {}) }
@@ -39,8 +40,9 @@ export async function issueTokens(event: H3Event | undefined, poolId: string, cl
   const issuer = `${publicUrl(event)}/${poolId}`
   const timestamp = Math.floor(Date.now() / 1000)
   const attributes = json<Record<string, string>>(user.attributes, {})
+  for (const claim of ['sub', 'username', 'cognito:username', 'token_use', 'client_id', 'scope', 'iss', 'aud', 'exp', 'iat', 'jti', 'nonce', 'cognito:groups']) delete attributes[claim]
   const groups = (db().prepare('SELECT group_name FROM memberships WHERE pool_id=? AND user_id=?').all(poolId, userId) as unknown as Array<{ group_name: string }>).map(row => row.group_name)
-  const common = { sub: user.id, username: user.username, 'cognito:username': user.username, ...attributes }
+  const common = { ...attributes, sub: user.id, username: user.username, 'cognito:username': user.username }
   const idToken = await new SignJWT({ ...common, token_use: 'id', ...(nonce ? { nonce } : {}) })
     .setProtectedHeader({ alg: 'RS256', kid: privateJwk.kid }).setIssuer(issuer).setAudience(clientId).setIssuedAt(timestamp).setExpirationTime(timestamp + 3600).sign(key)
   const accessToken = await new SignJWT({ ...common, token_use: 'access', client_id: clientId, scope: scopes.join(' '), ...(groups.length ? { 'cognito:groups': groups } : {}) })
@@ -79,10 +81,22 @@ export function createOpaqueToken(kind: 'authorization_code' | 'session', poolId
 }
 
 export function consumeOpaqueToken(raw: string, kind: string) {
-  const row = db().prepare('SELECT * FROM tokens WHERE token_hash=? AND kind=?').get(tokenHash(raw), kind) as unknown as Record<string, unknown> | undefined
-  if (!row || Number(row.expires_at) < epochMs() || row.revoked_at) cognitoError('NotAuthorizedException', `Invalid or expired ${kind}.`)
+  const row = getOpaqueToken(raw, kind)
   if (kind === 'authorization_code') db().prepare('UPDATE tokens SET revoked_at=? WHERE id=?').run(epochMs(), String(row.id))
   return row
+}
+
+export function getOpaqueToken(raw: string, kind: string) {
+  const row = db().prepare('SELECT * FROM tokens WHERE token_hash=? AND kind=?').get(tokenHash(raw), kind) as unknown as Record<string, unknown> | undefined
+  if (!row || Number(row.expires_at) < epochMs() || row.revoked_at) cognitoError('NotAuthorizedException', `Invalid or expired ${kind}.`)
+  return row
+}
+
+export function consumeAuthorizationCode(idValue: string) {
+  const timestamp = epochMs()
+  const result = db().prepare('UPDATE tokens SET revoked_at=? WHERE id=? AND kind=? AND revoked_at IS NULL AND expires_at>=?')
+    .run(timestamp, idValue, 'authorization_code', timestamp)
+  return result.changes === 1
 }
 
 export function revokeOpaqueToken(raw: string) {

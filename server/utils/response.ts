@@ -1,7 +1,7 @@
 import type { H3Event } from 'h3'
 import { getHeader, getRequestURL, setHeader, setResponseStatus } from 'h3'
 import { allowedOrigin } from './config'
-import { db } from './db'
+import { db, trimCorsEvents } from './db'
 import { epochMs } from './ids'
 
 export function applyCors(event: H3Event) {
@@ -9,6 +9,7 @@ export function applyCors(event: H3Event) {
   if (!origin) return true
   const allowed = allowedOrigin(origin)
   db().prepare('INSERT INTO cors_events(origin,path,allowed,created_at) VALUES(?,?,?,?)').run(origin, getRequestURL(event).pathname, Number(allowed), epochMs())
+  trimCorsEvents()
   if (allowed) {
     setHeader(event, 'access-control-allow-origin', origin)
     setHeader(event, 'vary', 'Origin')

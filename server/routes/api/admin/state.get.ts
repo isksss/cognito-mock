@@ -6,7 +6,7 @@ import { listClients, listPools, listUsers } from '../../../utils/models'
 
 export default defineEventHandler(event => {
   requireAdmin(event)
-  const pools = listPools().map(pool => ({ ...pool, settings: json(pool.settings, {}) }))
+  const pools = listPools().map(({ private_jwk: _privateJwk, ...pool }) => ({ ...pool, settings: json(pool.settings, {}) }))
   const clients = listClients().map(client => ({ ...client, callbacks: json(client.callbacks, []), logouts: json(client.logouts, []), scopes: json(client.scopes, []), theme: json(client.theme, {}) }))
   const users = pools.flatMap(pool => listUsers(pool.id).map(user => ({ ...user, password_hash: undefined, srp_verifier: undefined, attributes: json(user.attributes, {}) })))
   const groups = db().prepare('SELECT * FROM groups_table ORDER BY pool_id,name').all()

@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { defineEventHandler, getHeader, readFormData, setHeader } from 'h3'
-import { consumeOpaqueToken, issueTokens } from '../../utils/tokens'
+import { consumeAuthorizationCode, consumeOpaqueToken, getOpaqueToken, issueTokens } from '../../utils/tokens'
 import { getClient } from '../../utils/models'
 import { cognitoError } from '../../utils/errors'
 import { json } from '../../utils/ids'
@@ -21,16 +21,17 @@ export default defineEventHandler(async (event) => {
     const [basicId, basicSecret] = Buffer.from(authorization.slice(6), 'base64').toString().split(':')
     clientId = basicId || clientId; suppliedSecret = basicSecret || suppliedSecret
   }
+  const client = getClient(clientId)
+  if (!client) cognitoError('invalid_client', 'Unknown client.', 401)
+  if (client.secret && !safeEqual(client.secret, suppliedSecret)) cognitoError('invalid_client', 'Invalid client secret.', 401)
   if (grant === 'authorization_code') {
-    const row = consumeOpaqueToken(String(form.get('code') || ''), 'authorization_code')
+    const row = getOpaqueToken(String(form.get('code') || ''), 'authorization_code')
     if (row.client_id !== clientId || row.redirect_uri !== String(form.get('redirect_uri') || '')) cognitoError('invalid_grant', 'Authorization code does not match this request.')
-    const client = getClient(clientId)
-    if (!client) cognitoError('invalid_client', 'Unknown client.')
-    if (client.secret && !safeEqual(client.secret, suppliedSecret)) cognitoError('invalid_client', 'Invalid client secret.', 401)
     if (row.code_challenge) {
       const actual = createHash('sha256').update(String(form.get('code_verifier') || '')).digest('base64url')
       if (!safeEqual(String(row.code_challenge), actual)) cognitoError('invalid_grant', 'Invalid PKCE verifier.')
     }
+    if (!consumeAuthorizationCode(String(row.id))) cognitoError('invalid_grant', 'Authorization code has already been used.')
     const result = await issueTokens(event, String(row.pool_id), clientId, String(row.user_id), json<string[]>(String(row.scopes), []), row.nonce ? String(row.nonce) : undefined)
     return { access_token: result.AccessToken, id_token: result.IdToken, refresh_token: result.RefreshToken, expires_in: result.ExpiresIn, token_type: result.TokenType }
   }

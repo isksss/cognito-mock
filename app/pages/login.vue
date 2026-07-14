@@ -12,16 +12,21 @@ type Schema = z.output<typeof schema>
 const state = reactive<Partial<Schema>>({ username: String(route.query.login_hint || ''), password: '' })
 const error = ref('')
 const loading = ref(false)
+const passwordChallenge = useState<{ session: string, username: string } | null>('password-change-challenge', () => null)
 const queryString = computed(() => new URLSearchParams(Object.entries(route.query).map(([key, value]) => [key, String(value)])).toString())
 
 async function submit(event: FormSubmitEvent<Schema>) {
   loading.value = true; error.value = ''
   try {
-    const result = await $fetch<{ redirectTo?: string, challenge?: string }>('/api/auth/login', { method: 'POST', body: {
+    const result = await $fetch<{ redirectTo?: string, challenge?: string, session?: string, username?: string }>('/api/auth/login', { method: 'POST', body: {
       ...event.data, clientId: String(route.query.client_id || 'default-client'), redirectUri: String(route.query.redirect_uri || 'http://localhost:3001/callback'),
       scope: String(route.query.scope || 'openid'), state: String(route.query.state || ''), nonce: String(route.query.nonce || ''), codeChallenge: String(route.query.code_challenge || '')
     } })
-    if (result.challenge) { await navigateTo(`/new-password?${queryString.value}`); return }
+    if (result.challenge && result.session && result.username) {
+      passwordChallenge.value = { session: result.session, username: result.username }
+      await navigateTo(`/new-password?${queryString.value}`)
+      return
+    }
     if (result.redirectTo) await navigateTo(result.redirectTo, { external: true })
   } catch (cause: any) { error.value = cause?.data?.message || cause?.message || 'Authentication failed' } finally { loading.value = false }
 }

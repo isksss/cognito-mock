@@ -9,7 +9,7 @@ interface SeedClient { id: string, name?: string, secret?: string, callbacks?: s
 interface SeedUser { username: string, password: string, confirmed?: boolean, attributes?: Record<string, string>, groups?: string[] }
 interface SeedPool { id: string, name?: string, clients?: SeedClient[], users?: SeedUser[], groups?: Array<{ name: string, description?: string }> }
 
-export default defineNitroPlugin(() => {
+export default defineNitroPlugin(async () => {
   const path = process.env.CONFIG_PATH
   if (!path || !existsSync(path)) return
   const config = parse(readFileSync(path, 'utf8')) as { pools?: SeedPool[] }
@@ -24,7 +24,7 @@ export default defineNitroPlugin(() => {
     for (const group of seedPool.groups || []) db().prepare('INSERT INTO groups_table(pool_id,name,description,created_at) VALUES(?,?,?,?) ON CONFLICT(pool_id,name) DO UPDATE SET description=excluded.description').run(pool.id, group.name, group.description || null, epochMs())
     for (const seedUser of seedPool.users || []) {
       let user = findUser(pool.id, seedUser.username)
-      if (!user) user = createUser(pool.id, seedUser.username, seedUser.password, seedUser.attributes || {}, seedUser.confirmed === false ? 'UNCONFIRMED' : 'CONFIRMED')
+      if (!user) user = await createUser(pool.id, seedUser.username, seedUser.password, seedUser.attributes || {}, seedUser.confirmed === false ? 'UNCONFIRMED' : 'CONFIRMED')
       for (const group of seedUser.groups || []) db().prepare('INSERT OR IGNORE INTO memberships(pool_id,group_name,user_id) VALUES(?,?,?)').run(pool.id, group, user.id)
     }
   }

@@ -2,14 +2,22 @@ import { defineEventHandler, getHeader, readBody } from 'h3'
 import { db } from '../utils/db'
 import { CognitoError, cognitoError, sendCognitoError } from '../utils/errors'
 import { code, epochMs, id, json } from '../utils/ids'
-import { createCode, createUser, ensureClient, ensurePool, findUser, getPool, getUserById, listClients, listPools, listUsers, updateUser, type UserRow } from '../utils/models'
+import { createUser, ensureClient, ensurePool, findUser, getPool, getUserById, listClients, listPools, listUsers, updateUser, type UserRow } from '../utils/models'
 import { verifyPassword } from '../utils/password'
 import { consumeOpaqueToken, issueTokens, revokeOpaqueToken, verifyAccessToken } from '../utils/tokens'
 import { createSrpChallenge, verifySrpResponse } from '../utils/srp'
 import { shouldLogCodes } from '../utils/config'
+import { consumeChallengeSession, createChallengeSession } from '../utils/sessions'
+import { requireAdminOperation } from '../utils/admin'
+import { consumeVerificationCode, replaceVerificationCode } from '../utils/codes'
+import { assertRateLimit, clearRateLimit, consumeRateLimit, recordRateLimitFailure } from '../utils/rate-limit'
 
 type Input = Record<string, any>
-const attributesToObject = (attributes: Array<{ Name: string, Value?: string }> = []) => Object.fromEntries(attributes.map(attribute => [attribute.Name, attribute.Value || '']))
+const reservedAttributes = new Set(['sub', 'username', 'cognito:username', 'token_use', 'client_id', 'scope', 'iss', 'aud', 'exp', 'iat', 'jti', 'nonce', 'cognito:groups'])
+const attributesToObject = (attributes: Array<{ Name: string, Value?: string }> = []) => Object.fromEntries(attributes.map(attribute => {
+  if (reservedAttributes.has(attribute.Name)) cognitoError('InvalidParameterException', `Attribute ${attribute.Name} is reserved.`)
+  return [attribute.Name, attribute.Value || '']
+}))
 const objectToAttributes = (value: string | Record<string, string>) => Object.entries(typeof value === 'string' ? json<Record<string, string>>(value, {}) : value).map(([Name, Value]) => ({ Name, Value }))
 const userShape = (user: UserRow) => ({
   Username: user.username, UserAttributes: objectToAttributes(user.attributes), Attributes: objectToAttributes(user.attributes),
@@ -25,17 +33,22 @@ function requireUser(poolId: string, username: string) {
   return user
 }
 
-function confirmation(user: UserRow, clientId: string, kind: string) {
+function confirmation(event: Parameters<typeof issueTokens>[0], user: UserRow, clientId: string, kind: string) {
+  consumeRateLimit(event!, `send-${kind}`, `${clientId}:${user.username}`, 5)
   const value = code()
-  createCode(user.pool_id, clientId, user.id, kind, value)
+  replaceVerificationCode(user.pool_id, clientId, user.id, kind, value)
   if (shouldLogCodes()) console.info(`[cognito-mock] ${kind} code for ${user.username}: ${value}`)
   return { CodeDeliveryDetails: { Destination: json<Record<string, string>>(user.attributes, {}).email || user.username, DeliveryMedium: 'EMAIL', AttributeName: 'email' } }
 }
 
-function consumeCode(user: UserRow, kind: string, value: string) {
-  const record = db().prepare('SELECT * FROM codes WHERE user_id=? AND kind=? AND code=? AND used_at IS NULL ORDER BY created_at DESC').get(user.id, kind, value) as unknown as { id: string, expires_at: number } | undefined
-  if (!record || record.expires_at < epochMs()) cognitoError('CodeMismatchException', 'Invalid verification code provided.')
-  db().prepare('UPDATE codes SET used_at=? WHERE id=?').run(epochMs(), record.id)
+function consumeCode(event: Parameters<typeof issueTokens>[0], user: UserRow, kind: string, value: string) {
+  const subject = `${user.pool_id}:${user.username}`
+  assertRateLimit(event!, `verify-${kind}`, subject, 5)
+  if (!consumeVerificationCode(user.id, kind, value)) {
+    recordRateLimitFailure(event!, `verify-${kind}`, subject)
+    cognitoError('CodeMismatchException', 'Invalid verification code provided.')
+  }
+  clearRateLimit(event!, `verify-${kind}`, subject)
 }
 
 async function authenticate(event: Parameters<typeof issueTokens>[0], clientId: string, poolId: string, input: Input, admin = false) {
@@ -47,47 +60,56 @@ async function authenticate(event: Parameters<typeof issueTokens>[0], clientId: 
     return { AuthenticationResult: await issueTokens(event, String(row.pool_id), clientId, String(row.user_id), json<string[]>(String(row.scopes), []), undefined, false) }
   }
   const username = parameters.USERNAME || parameters.USER_ID_FOR_SRP
+  consumeRateLimit(event!, 'cognito-login-ip', '*', 60, 60_000)
+  const loginSubject = `${clientId}:${username || ''}`
+  assertRateLimit(event!, 'cognito-login', loginSubject, 5)
   const user = requireUser(poolId, username)
   if (!user.enabled) cognitoError('NotAuthorizedException', 'User is disabled.')
   if (user.status === 'UNCONFIRMED') cognitoError('UserNotConfirmedException', 'User is not confirmed.')
   if (flow === 'USER_SRP_AUTH') {
     if (!user.srp_verifier || !user.srp_salt || !parameters.SRP_A) cognitoError('InvalidParameterException', 'SRP parameters are invalid.')
     const challenge = createSrpChallenge(user.srp_verifier)
-    const session = id(32)
-    db().prepare('INSERT INTO sessions(id,pool_id,client_id,user_id,data,expires_at,created_at) VALUES(?,?,?,?,?,?,?)').run(session, poolId, clientId, user.id, JSON.stringify({ ...challenge, A: parameters.SRP_A }), epochMs() + 5 * 60_000, epochMs())
+    const session = createChallengeSession(poolId, clientId, user.id, { challengeName: 'PASSWORD_VERIFIER', ...challenge, A: parameters.SRP_A })
     return { ChallengeName: 'PASSWORD_VERIFIER', Session: session, ChallengeParameters: { USER_ID_FOR_SRP: user.username, USERNAME: user.username, SRP_B: challenge.B, SALT: user.srp_salt, SECRET_BLOCK: challenge.secretBlock } }
   }
   const passwordFlows = admin ? ['ADMIN_USER_PASSWORD_AUTH', 'ADMIN_NO_SRP_AUTH'] : ['USER_PASSWORD_AUTH']
-  if (!passwordFlows.includes(flow) || !verifyPassword(parameters.PASSWORD || '', user.password_hash)) cognitoError('NotAuthorizedException', 'Incorrect username or password.')
+  if (!passwordFlows.includes(flow) || !await verifyPassword(parameters.PASSWORD || '', user.password_hash)) {
+    recordRateLimitFailure(event!, 'cognito-login', loginSubject)
+    cognitoError('NotAuthorizedException', 'Incorrect username or password.')
+  }
+  clearRateLimit(event!, 'cognito-login', loginSubject)
   if (user.status === 'FORCE_CHANGE_PASSWORD') {
-    const session = id(32)
-    db().prepare('INSERT INTO sessions(id,pool_id,client_id,user_id,data,expires_at,created_at) VALUES(?,?,?,?,?,?,?)').run(session, poolId, clientId, user.id, '{}', epochMs() + 5 * 60_000, epochMs())
+    const session = createChallengeSession(poolId, clientId, user.id, { challengeName: 'NEW_PASSWORD_REQUIRED' })
     return { ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: session, ChallengeParameters: { USERNAME: user.username, requiredAttributes: '[]', userAttributes: user.attributes } }
   }
   return { AuthenticationResult: await issueTokens(event, poolId, clientId, user.id, ['openid', 'email', 'profile']) }
 }
 
 async function respondToChallenge(event: Parameters<typeof issueTokens>[0], input: Input) {
-  const session = db().prepare('SELECT * FROM sessions WHERE id=?').get(input.Session) as unknown as { id: string, pool_id: string, client_id: string, user_id: string, data: string, expires_at: number } | undefined
-  if (!session || session.expires_at < epochMs()) cognitoError('NotAuthorizedException', 'Invalid session.')
-  const user = getUserById(session.user_id)!
+  if (input.ChallengeName !== 'NEW_PASSWORD_REQUIRED' && input.ChallengeName !== 'PASSWORD_VERIFIER') cognitoError('InvalidParameterException', 'Unsupported challenge.')
+  const session = consumeChallengeSession(input.Session || '', input.ChallengeName, input.ClientId)
+  const user = getUserById(session.userId)
+  if (!user || !user.enabled || user.pool_id !== session.poolId) cognitoError('NotAuthorizedException', 'Invalid session user.')
+  const responseUsername = input.ChallengeResponses?.USERNAME || input.ChallengeResponses?.USER_ID_FOR_SRP
+  if (responseUsername && responseUsername !== user.username) cognitoError('NotAuthorizedException', 'Session does not match this user.')
   if (input.ChallengeName === 'NEW_PASSWORD_REQUIRED') {
     const password = input.ChallengeResponses?.NEW_PASSWORD
     if (!password) cognitoError('InvalidParameterException', 'NEW_PASSWORD is required.')
-    updateUser(user.id, { password, status: 'CONFIRMED' })
+    if (user.status !== 'FORCE_CHANGE_PASSWORD') cognitoError('NotAuthorizedException', 'Password change challenge is not active.')
+    await updateUser(user.id, { password, status: 'CONFIRMED' })
   } else if (input.ChallengeName === 'PASSWORD_VERIFIER') {
-    const data = json<Record<string, string>>(session.data, {})
+    const data = session.data as Record<string, string>
     const response = input.ChallengeResponses || {}
-    const valid = verifySrpResponse({ poolId: session.pool_id, username: user.username, verifier: user.srp_verifier!, b: data.b!, B: data.B!, A: data.A!, secretBlock: data.secretBlock!, timestamp: response.TIMESTAMP || '', signature: response.PASSWORD_CLAIM_SIGNATURE || '' })
+    const valid = verifySrpResponse({ poolId: session.poolId, username: user.username, verifier: user.srp_verifier!, b: data.b!, B: data.B!, A: data.A!, secretBlock: data.secretBlock!, timestamp: response.TIMESTAMP || '', signature: response.PASSWORD_CLAIM_SIGNATURE || '' })
     if (!valid) cognitoError('NotAuthorizedException', 'Incorrect username or password.')
-  } else cognitoError('InvalidParameterException', 'Unsupported challenge.')
-  db().prepare('DELETE FROM sessions WHERE id=?').run(session.id)
-  return { AuthenticationResult: await issueTokens(event, session.pool_id, session.client_id, user.id, ['openid', 'email', 'profile']) }
+  }
+  return { AuthenticationResult: await issueTokens(event, session.poolId, session.clientId, user.id, ['openid', 'email', 'profile']) }
 }
 
 export default defineEventHandler(async (event) => {
   try {
     const target = (getHeader(event, 'x-amz-target') || '').split('.').pop() || ''
+    requireAdminOperation(event, target)
     const input = await readBody<Input>(event) || {}
     switch (target) {
       case 'CreateUserPool': {
@@ -114,31 +136,31 @@ export default defineEventHandler(async (event) => {
       }
       case 'DeleteUserPoolClient': db().prepare('DELETE FROM clients WHERE id=? AND pool_id=?').run(input.ClientId, input.UserPoolId); return {}
       case 'SignUp': {
-        const client = ensureClient(input.ClientId); const user = createUser(client.pool_id, input.Username, input.Password, attributesToObject(input.UserAttributes))
-        return { UserSub: user.id, UserConfirmed: false, ...confirmation(user, client.id, 'signup') }
+        const client = ensureClient(input.ClientId); const user = await createUser(client.pool_id, input.Username, input.Password, attributesToObject(input.UserAttributes))
+        return { UserSub: user.id, UserConfirmed: false, ...confirmation(event, user, client.id, 'signup') }
       }
-      case 'ConfirmSignUp': { const client = ensureClient(input.ClientId); const user = requireUser(client.pool_id, input.Username); consumeCode(user, 'signup', input.ConfirmationCode); updateUser(user.id, { status: 'CONFIRMED', attributes: { email_verified: 'true' } }); return {} }
-      case 'ResendConfirmationCode': { const client = ensureClient(input.ClientId); return confirmation(requireUser(client.pool_id, input.Username), client.id, 'signup') }
-      case 'ForgotPassword': { const client = ensureClient(input.ClientId); return confirmation(requireUser(client.pool_id, input.Username), client.id, 'forgot') }
-      case 'ConfirmForgotPassword': { const client = ensureClient(input.ClientId); const user = requireUser(client.pool_id, input.Username); consumeCode(user, 'forgot', input.ConfirmationCode); updateUser(user.id, { password: input.Password, status: 'CONFIRMED' }); return {} }
+      case 'ConfirmSignUp': { const client = ensureClient(input.ClientId); const user = requireUser(client.pool_id, input.Username); consumeCode(event, user, 'signup', input.ConfirmationCode); await updateUser(user.id, { status: 'CONFIRMED', attributes: { email_verified: 'true' } }); return {} }
+      case 'ResendConfirmationCode': { const client = ensureClient(input.ClientId); return confirmation(event, requireUser(client.pool_id, input.Username), client.id, 'signup') }
+      case 'ForgotPassword': { const client = ensureClient(input.ClientId); return confirmation(event, requireUser(client.pool_id, input.Username), client.id, 'forgot') }
+      case 'ConfirmForgotPassword': { const client = ensureClient(input.ClientId); const user = requireUser(client.pool_id, input.Username); consumeCode(event, user, 'forgot', input.ConfirmationCode); await updateUser(user.id, { password: input.Password, status: 'CONFIRMED' }); return {} }
       case 'InitiateAuth': { const client = ensureClient(input.ClientId); return await authenticate(event, client.id, client.pool_id, input) }
       case 'AdminInitiateAuth': { const client = ensureClient(input.ClientId, input.UserPoolId); return await authenticate(event, client.id, input.UserPoolId, input, true) }
       case 'RespondToAuthChallenge': case 'AdminRespondToAuthChallenge': return await respondToChallenge(event, input)
       case 'RevokeToken': revokeOpaqueToken(input.Token); return {}
       case 'GetUser': { const payload = await verifyAccessToken(input.AccessToken); const poolId = String(payload.iss).split('/').pop()!; return userShape(requireUser(poolId, String(payload.username))) }
-      case 'UpdateUserAttributes': { const payload = await verifyAccessToken(input.AccessToken); const poolId = String(payload.iss).split('/').pop()!; const user = requireUser(poolId, String(payload.username)); updateUser(user.id, { attributes: attributesToObject(input.UserAttributes) }); return {} }
+      case 'UpdateUserAttributes': { const payload = await verifyAccessToken(input.AccessToken); const poolId = String(payload.iss).split('/').pop()!; const user = requireUser(poolId, String(payload.username)); await updateUser(user.id, { attributes: attributesToObject(input.UserAttributes) }); return {} }
       case 'DeleteUserAttributes': { const payload = await verifyAccessToken(input.AccessToken); const user = getUserById(String(payload.sub))!; const attrs = json<Record<string, string>>(user.attributes, {}); for (const name of input.UserAttributeNames || []) delete attrs[name]; db().prepare('UPDATE users SET attributes=?,updated_at=? WHERE id=?').run(JSON.stringify(attrs), epochMs(), user.id); return {} }
-      case 'ChangePassword': { const payload = await verifyAccessToken(input.AccessToken); const user = getUserById(String(payload.sub))!; if (!verifyPassword(input.PreviousPassword, user.password_hash)) cognitoError('NotAuthorizedException', 'Incorrect password.'); updateUser(user.id, { password: input.ProposedPassword }); return {} }
+      case 'ChangePassword': { const payload = await verifyAccessToken(input.AccessToken); const user = getUserById(String(payload.sub))!; if (!await verifyPassword(input.PreviousPassword, user.password_hash)) cognitoError('NotAuthorizedException', 'Incorrect password.'); await updateUser(user.id, { password: input.ProposedPassword }); return {} }
       case 'GlobalSignOut': { const payload = await verifyAccessToken(input.AccessToken); db().prepare('UPDATE tokens SET revoked_at=? WHERE user_id=?').run(epochMs(), String(payload.sub)); return {} }
       case 'DeleteUser': { const payload = await verifyAccessToken(input.AccessToken); db().prepare('DELETE FROM users WHERE id=?').run(String(payload.sub)); return {} }
-      case 'AdminCreateUser': { const password = input.TemporaryPassword || `Temp-${id(8)}!`; const user = createUser(input.UserPoolId, input.Username, password, attributesToObject(input.UserAttributes), 'FORCE_CHANGE_PASSWORD'); return { User: userShape(user) } }
-      case 'AdminConfirmSignUp': { const user = requireUser(input.UserPoolId, input.Username); updateUser(user.id, { status: 'CONFIRMED' }); return {} }
+      case 'AdminCreateUser': { const password = input.TemporaryPassword || `Temp-${id(8)}!`; const user = await createUser(input.UserPoolId, input.Username, password, attributesToObject(input.UserAttributes), 'FORCE_CHANGE_PASSWORD'); return { User: userShape(user) } }
+      case 'AdminConfirmSignUp': { const user = requireUser(input.UserPoolId, input.Username); await updateUser(user.id, { status: 'CONFIRMED' }); return {} }
       case 'AdminGetUser': return userShape(requireUser(input.UserPoolId, input.Username))
-      case 'AdminUpdateUserAttributes': { const user = requireUser(input.UserPoolId, input.Username); updateUser(user.id, { attributes: attributesToObject(input.UserAttributes) }); return {} }
+      case 'AdminUpdateUserAttributes': { const user = requireUser(input.UserPoolId, input.Username); await updateUser(user.id, { attributes: attributesToObject(input.UserAttributes) }); return {} }
       case 'AdminDeleteUserAttributes': { const user = requireUser(input.UserPoolId, input.Username); const attrs = json<Record<string, string>>(user.attributes, {}); for (const name of input.UserAttributeNames || []) delete attrs[name]; db().prepare('UPDATE users SET attributes=?,updated_at=? WHERE id=?').run(JSON.stringify(attrs), epochMs(), user.id); return {} }
-      case 'AdminSetUserPassword': { const user = requireUser(input.UserPoolId, input.Username); updateUser(user.id, { password: input.Password, status: input.Permanent ? 'CONFIRMED' : 'FORCE_CHANGE_PASSWORD' }); return {} }
-      case 'AdminEnableUser': updateUser(requireUser(input.UserPoolId, input.Username).id, { enabled: true }); return {}
-      case 'AdminDisableUser': updateUser(requireUser(input.UserPoolId, input.Username).id, { enabled: false }); return {}
+      case 'AdminSetUserPassword': { const user = requireUser(input.UserPoolId, input.Username); await updateUser(user.id, { password: input.Password, status: input.Permanent ? 'CONFIRMED' : 'FORCE_CHANGE_PASSWORD' }); return {} }
+      case 'AdminEnableUser': await updateUser(requireUser(input.UserPoolId, input.Username).id, { enabled: true }); return {}
+      case 'AdminDisableUser': await updateUser(requireUser(input.UserPoolId, input.Username).id, { enabled: false }); return {}
       case 'AdminDeleteUser': db().prepare('DELETE FROM users WHERE id=?').run(requireUser(input.UserPoolId, input.Username).id); return {}
       case 'ListUsers': return { Users: listUsers(input.UserPoolId).map(userShape) }
       case 'CreateGroup': { ensurePool(input.UserPoolId); db().prepare('INSERT INTO groups_table(pool_id,name,description,precedence,role_arn,created_at) VALUES(?,?,?,?,?,?)').run(input.UserPoolId, input.GroupName, input.Description || null, input.Precedence ?? null, input.RoleArn || null, epochMs()); return { Group: { GroupName: input.GroupName, UserPoolId: input.UserPoolId, Description: input.Description, Precedence: input.Precedence, RoleArn: input.RoleArn } } }

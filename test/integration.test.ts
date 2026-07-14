@@ -31,7 +31,8 @@ async function aws<T = Record<string, unknown>>(operation: string, body: Record<
       'content-type': 'application/x-amz-json-1.1',
       'x-amz-target': `AWSCognitoIdentityProviderService.${operation}`,
       'x-amz-date': '20260714T000000Z',
-      'x-amz-security-token': 'local'
+      'x-amz-security-token': 'local',
+      authorization: `Bearer ${adminToken}`
     },
     body
   })
@@ -173,6 +174,89 @@ describe('Cognito User Pools AWS JSON protocol', () => {
     })
     expect(decodeJwt(result.AuthenticationResult.AccessToken)).toMatchObject({ token_use: 'access', client_id: clientId })
   })
+
+  it('protects AWS JSON management operations while leaving user operations available', async () => {
+    const management = await fetch('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSCognitoIdentityProviderService.ListUserPools' },
+      body: '{}'
+    })
+    expect(management.status).toBe(401)
+  })
+
+  it('rejects challenge-type substitution and consumes the attacked session', async () => {
+    const challenge = await aws<{ Session: string }>('InitiateAuth', {
+      ClientId: clientId,
+      AuthFlow: 'USER_SRP_AUTH',
+      AuthParameters: { USERNAME: username, SRP_A: '2' }
+    })
+    const substitute = await fetch('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSCognitoIdentityProviderService.RespondToAuthChallenge' },
+      body: JSON.stringify({ ClientId: clientId, ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: challenge.Session, ChallengeResponses: { USERNAME: username, NEW_PASSWORD: 'AttackerPassword123!' } })
+    })
+    expect(substitute.status).toBe(400)
+    const replay = await fetch('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSCognitoIdentityProviderService.RespondToAuthChallenge' },
+      body: JSON.stringify({ ClientId: clientId, ChallengeName: 'PASSWORD_VERIFIER', Session: challenge.Session, ChallengeResponses: { USERNAME: username } })
+    })
+    expect(replay.status).toBe(400)
+    await expect(aws('InitiateAuth', { ClientId: clientId, AuthFlow: 'USER_PASSWORD_AUTH', AuthParameters: { USERNAME: username, PASSWORD: password } })).resolves.toHaveProperty('AuthenticationResult')
+  })
+
+  it('rejects reserved user attributes', async () => {
+    const auth = await aws<{ AuthenticationResult: { AccessToken: string } }>('InitiateAuth', {
+      ClientId: clientId,
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      AuthParameters: { USERNAME: username, PASSWORD: password }
+    })
+    const response = await fetch('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'AWSCognitoIdentityProviderService.UpdateUserAttributes' },
+      body: JSON.stringify({ AccessToken: auth.AuthenticationResult.AccessToken, UserAttributes: [{ Name: 'sub', Value: 'victim-user-id' }] })
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ __type: 'InvalidParameterException' })
+  })
+
+  it('requires and consumes a password-change session for Managed Login', async () => {
+    const forcedUsername = 'force-change@example.com'
+    const temporaryPassword = 'TemporaryPassword123!'
+    await $fetch('/', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${adminToken}`,
+        'content-type': 'application/x-amz-json-1.1',
+        'x-amz-target': 'AWSCognitoIdentityProviderService.AdminCreateUser'
+      },
+      body: { UserPoolId: poolId, Username: forcedUsername, TemporaryPassword: temporaryPassword }
+    })
+
+    const direct = await fetch('/api/auth/new-password', {
+      method: 'POST',
+      body: JSON.stringify({ username: forcedUsername, clientId, password: 'AttackerPassword123!' }),
+      headers: { 'content-type': 'application/json' }
+    })
+    expect(direct.status).toBe(400)
+
+    const login = await $fetch<{ challenge: string, session: string }>('/api/auth/login', {
+      method: 'POST',
+      body: { clientId, username: forcedUsername, password: temporaryPassword, redirectUri: 'http://localhost:5173/callback', scope: 'openid', codeChallenge: 'A'.repeat(43) }
+    })
+    expect(login).toMatchObject({ challenge: 'NEW_PASSWORD_REQUIRED', session: expect.any(String) })
+    const changed = await $fetch<{ redirectTo: string }>('/api/auth/new-password', {
+      method: 'POST',
+      body: { session: login.session, password: 'ChangedPassword123!' }
+    })
+    expect(changed.redirectTo).toContain('http://localhost:5173/callback?code=')
+    const replay = await fetch('/api/auth/new-password', {
+      method: 'POST',
+      body: JSON.stringify({ session: login.session, password: 'AnotherPassword123!' }),
+      headers: { 'content-type': 'application/json' }
+    })
+    expect(replay.status).toBe(400)
+  })
 })
 
 describe('OAuth 2.0 and OpenID Connect', () => {
@@ -234,7 +318,50 @@ describe('OAuth 2.0 and OpenID Connect', () => {
     const invalid = await fetch('/oauth2/token', { method: 'POST', body: new URLSearchParams({ grant_type: 'authorization_code', client_id: clientId, redirect_uri: 'http://localhost:5173/callback', code, code_verifier: 'incorrect' }) })
     expect(invalid.status).toBe(400)
 
+    const valid = await fetch('/oauth2/token', { method: 'POST', body: new URLSearchParams({ grant_type: 'authorization_code', client_id: clientId, redirect_uri: 'http://localhost:5173/callback', code, code_verifier: verifier }) })
+    expect(valid.status).toBe(200)
+
     const reused = await fetch('/oauth2/token', { method: 'POST', body: new URLSearchParams({ grant_type: 'authorization_code', client_id: clientId, redirect_uri: 'http://localhost:5173/callback', code, code_verifier: verifier }) })
     expect(reused.status).toBe(400)
+  })
+
+  it('rejects a direct Managed Login request for an unregistered callback', async () => {
+    const response = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId, username, password, redirectUri: 'https://attacker.example/callback', scope: 'openid', codeChallenge: challenge })
+    })
+    expect(response.status).toBe(400)
+  })
+
+  it('requires the confidential client secret when refreshing tokens', async () => {
+    const secretClientId = 'integrationsecretclient'
+    const created = await aws<{ UserPoolClient: { ClientSecret: string } }>('CreateUserPoolClient', {
+      UserPoolId: poolId,
+      ClientId: secretClientId,
+      ClientName: 'Secret client',
+      GenerateSecret: true,
+      CallbackURLs: ['http://localhost:5173/secret-callback'],
+      AllowedOAuthScopes: ['openid']
+    })
+    const login = await $fetch<{ redirectTo: string }>('/api/auth/login', {
+      method: 'POST',
+      body: { clientId: secretClientId, username, password, redirectUri: 'http://localhost:5173/secret-callback', scope: 'openid', codeChallenge: challenge }
+    })
+    const code = new URL(login.redirectTo).searchParams.get('code')!
+    const tokens = await $fetch<{ refresh_token: string }>('/oauth2/token', {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'authorization_code', client_id: secretClientId, client_secret: created.UserPoolClient.ClientSecret, redirect_uri: 'http://localhost:5173/secret-callback', code, code_verifier: verifier })
+    })
+    const unauthenticated = await fetch('/oauth2/token', {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: secretClientId, refresh_token: tokens.refresh_token })
+    })
+    expect(unauthenticated.status).toBe(401)
+    const authenticated = await fetch('/oauth2/token', {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: secretClientId, client_secret: created.UserPoolClient.ClientSecret, refresh_token: tokens.refresh_token })
+    })
+    expect(authenticated.status).toBe(200)
   })
 })
