@@ -4,6 +4,11 @@ services:
     image: ghcr.io/isksss/cognito-mock:latest
     ports:
       - "9999:9999"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       PUBLIC_URL: http://localhost:9999
       COGNITO_MOCK_MODE: permissive
