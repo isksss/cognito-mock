@@ -8,10 +8,28 @@ services:
       PUBLIC_URL: http://localhost:9999
       COGNITO_MOCK_MODE: permissive
       ALLOWED_ORIGINS: http://localhost:3001
+      ADMIN_TOKEN: local-example-admin-token
       CONFIG_PATH: /config/cognito-mock.yml
     volumes:
       - cognito-data:/data
       - ./examples/cognito-mock.yml:/config/cognito-mock.yml:ro
+
+  example:
+    build: ./example
+    ports:
+      - "3001:3001"
+    environment:
+      NUXT_COGNITO_ENDPOINT: http://cognito-mock:9999
+      NUXT_PUBLIC_COGNITO_URL: http://localhost:9999
+      NUXT_APP_URL: http://localhost:3001
+      NUXT_COGNITO_REGION: ap-northeast-1
+      NUXT_COGNITO_USER_POOL_ID: ap-northeast-1_example
+      NUXT_COGNITO_CLIENT_ID: exampleclientid
+      NUXT_COGNITO_ADMIN_TOKEN: local-example-admin-token
+      NUXT_SESSION_PASSWORD: local-example-session-password-32-chars
+    depends_on:
+      cognito-mock:
+        condition: service_healthy
 
 volumes:
   cognito-data:

@@ -4,11 +4,13 @@ pools:
     groups:
       - name: developers
         description: Local developers
+      - name: admins
+        description: Example application administrators
     clients:
       - id: exampleclientid
         name: Example web app
         callbacks:
-          - http://localhost:3001/callback
+          - http://localhost:3001/auth/callback
         logouts:
           - http://localhost:3001
         scopes: [openid, email, profile]
@@ -23,4 +25,4 @@ pools:
           email: developer@example.com
           email_verified: "true"
           name: Local Developer
-        groups: [developers]
+        groups: [developers, admins]

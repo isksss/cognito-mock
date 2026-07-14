@@ -1,0 +1,44 @@
+[tools]
+node = "24.18.0"
+pnpm = "11.11.0"
+
+[tasks.install]
+description = "サービスとサンプルの依存関係をインストール"
+run = [
+  "pnpm install --frozen-lockfile",
+  "pnpm --dir example install --frozen-lockfile",
+]
+
+[tasks."dev:service"]
+description = "cognito-mockをポート9999で起動"
+run = "pnpm dev"
+
+[tasks."dev:example"]
+description = "Nuxtサンプルをポート3001で起動"
+dir = "example"
+run = "pnpm dev"
+
+[tasks.dev]
+description = "サービスとサンプルを並列起動"
+depends = ["dev:service", "dev:example"]
+
+[tasks.check]
+description = "サービスとサンプルの静的検査・テスト・ビルド"
+run = [
+  "pnpm lint",
+  "pnpm typecheck",
+  "pnpm test",
+  "pnpm build",
+  "pnpm --dir example typecheck",
+  "pnpm --dir example test",
+  "pnpm --dir example build",
+]
+
+[tasks.e2e]
+description = "Compose環境に対するPlaywright E2Eテスト"
+dir = "example"
+run = "pnpm test:e2e"
+
+[tasks.compose]
+description = "Docker Composeでサービスとサンプルを起動"
+run = "docker compose up --build"
